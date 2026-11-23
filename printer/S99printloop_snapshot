@@ -1,0 +1,29 @@
+#!/bin/sh
+#
+# printloop camera snapshot server (http://<printer>:8090/snapshot.jpg)
+# Remove with: /etc/init.d/S99printloop_snapshot stop; rm /etc/init.d/S99printloop_snapshot; rm -r /usr/data/printloop
+#
+
+PROG=/usr/data/printloop/snapshot_server.py
+PID_FILE=/var/run/printloop_snapshot.pid
+
+start() {
+    printf "Starting printloop snapshot server: "
+    start-stop-daemon -S -b -m -p $PID_FILE -N 10 --exec /usr/bin/python3 -- $PROG
+    [ $? = 0 ] && echo "OK" || echo "FAIL"
+}
+
+stop() {
+    printf "Stopping printloop snapshot server: "
+    start-stop-daemon -K -p $PID_FILE
+    [ $? = 0 ] && echo "OK" || echo "FAIL"
+    rm -f $PID_FILE
+}
+
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    restart|reload) stop; sleep 1; start ;;
+    *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
+exit 0
