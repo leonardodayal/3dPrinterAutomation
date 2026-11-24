@@ -96,7 +96,7 @@ def make_wf(tmp_path, monkeypatch):
     def make(printer_script, detector_script, answers):
         cfg = replace(Config.load(), runs_dir=tmp_path, thermal_protection_verified=True,
                       slack_webhook_url=None, slack_bot_token=None, approval_backend="cli",
-                      check_interval_seconds=0, obico_ml_url="http://ml")
+                      check_interval_seconds=0, obico_ml_url="http://ml", bed_photo_z=0, finish_photo_lift=False)
         w = wf_mod.Workflow(cfg, "a cube", tmp_path / "run")
         w.slack.enabled = True  # enabled, but posting is stubbed below
         w.slack.post = lambda *a, **k: None
@@ -242,3 +242,16 @@ def test_revise_images_are_added_to_reference_images(make_wf):
     assert [p.name for p in w.reference_images] == ["ref1_01-side_view.png", "ref2_02-IMG_1.jpg"]
     w.add_reference_images([{"name": "more.png", "mimetype": "image/png"}])
     assert w.reference_images[-1].name == "ref3_03-more.png" and all(p.exists() for p in w.reference_images)
+
+
+def test_bed_photo_moves_go_to_the_workflows_printer(make_wf):
+    """Regression: bed moves once went to the real Moonraker client instead of the swapped-in printer."""
+    from dataclasses import replace as dc_replace
+    w = make_wf(printer_script=[], detector_script=[], answers=[])
+    w.cfg = dc_replace(w.cfg, bed_photo_z=48, finish_photo_lift=True)
+    sent = []
+    w.printer.toolhead = lambda: {"homed_axes": "xyz", "position": [0, 0, 48, 0], "axis_maximum": [229, 227, 255, 0]}
+    w.printer.gcode = sent.append
+    w.bed_snap("bed", wf_mod.Plan(Path("m.scad"), Path("m.stl"), None))
+    w.lower_bed()
+    assert any("G1 Z48.0" in g for g in sent) and any("G1 Z250.0" in g for g in sent)

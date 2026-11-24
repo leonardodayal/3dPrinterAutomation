@@ -77,7 +77,7 @@ class Workflow:
         self.base_settings: dict[str, str] = {}
         self.history: list[str] = []
         self.pool = ThreadPoolExecutor(max_workers=1)
-        self.bedview = BedView(self.printer, cfg.runs_dir / "bed_state.json", cfg.photo_park_xy, self.log)
+
         self.reference_images = design.prepare_images(images or [], self.run_dir / "reference")
 
     # ------------------------------------------------------------------ setup
@@ -456,6 +456,11 @@ class Workflow:
             return
         self.reference_images += new
         self.log.log("reference_images_added", images=[p.name for p in new])
+
+    @property
+    def bedview(self) -> BedView:
+        # Built on use so it always drives the current self.printer (tests swap in a fake one).
+        return BedView(self.printer, self.cfg.runs_dir / "bed_state.json", self.cfg.photo_park_xy, self.log)
 
     def _height(self, plan: Plan) -> float:
         try:
