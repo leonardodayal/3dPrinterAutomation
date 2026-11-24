@@ -82,11 +82,12 @@ def render(openscad_bin: str, scad: Path) -> tuple[Path, Path | None]:
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 
 
-def prepare_images(paths: Sequence[Path], dest: Path) -> list[Path]:
-    """Copy reference images into the run folder (kept with the run), converting HEIC photos to JPEG."""
+def prepare_images(paths: Sequence[Path], dest: Path, start: int = 1) -> list[Path]:
+    """Copy reference images into the run folder (kept with the run), converting HEIC photos to JPEG.
+    start: number of the first image (images added later in a run continue the numbering)."""
     dest.mkdir(parents=True, exist_ok=True)
     out = []
-    for i, src in enumerate(paths, 1):
+    for i, src in enumerate(paths, start):
         src = Path(src).expanduser()
         if not src.is_file():
             raise FileNotFoundError(f"Reference image not found: {src}")

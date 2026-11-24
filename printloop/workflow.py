@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import camera, claude, design, fixer, slicer
+from .bedview import BedView, gcode_max_z
 from .approval import Approver
 from .config import Config
 from .detectors import Decision, K1CBuiltinDetector, ObicoDetector, Verdict, dual_rule
@@ -51,7 +52,9 @@ def _fmt_status(st: PrintStatus) -> str:
 
 class Workflow:
     def __init__(self, cfg: Config, request: str, run_dir: Path | None = None, images: list[Path] | None = None,
-                 slack: slack_mod.Slack | None = None, requester: str | None = None, on_phase=None):
+                 slack: slack_mod.Slack | None = None, requester: str | None = None, on_phase=None,
+                 should_stop=None):
+        """should_stop(): True once the job was cancelled in Slack (checked before designing/asking)."""
         self.cfg = cfg
         self.request = request
         self.run_dir = run_dir or cfg.runs_dir / time.strftime("%Y%m%d-%H%M%S")
@@ -62,8 +65,9 @@ class Workflow:
         self.requester = requester
         self.phase = "starting"
         self._on_phase = on_phase
+        self._should_stop = should_stop
         self.approver = Approver(cfg.approval_backend, self.slack, self.log, cfg.approval_poll_seconds,
-                                 approvers=set(cfg.approver_user_ids))
+                                 approvers=set(cfg.approver_user_ids), requester=requester)
         self.detectors = [
             ObicoDetector(cfg.obico_ml_url, cfg.obico_ml_token, cfg.obico_threshold,
                           cfg.obico_high_threshold, cfg.obico_consecutive_hits),
@@ -73,6 +77,7 @@ class Workflow:
         self.base_settings: dict[str, str] = {}
         self.history: list[str] = []
         self.pool = ThreadPoolExecutor(max_workers=1)
+        self.bedview = BedView(self.printer, cfg.runs_dir / "bed_state.json", cfg.photo_park_xy, self.log)
         self.reference_images = design.prepare_images(images or [], self.run_dir / "reference")
 
     # ------------------------------------------------------------------ setup
@@ -152,6 +157,8 @@ class Workflow:
 
     def set_phase(self, phase: str) -> None:
         """designing | awaiting_approval | printing | recovering | done (reported to `printloop serve`)."""
+        if phase in ("designing", "awaiting_approval") and self._should_stop and self._should_stop():
+            raise Abort("cancelled in Slack")
         self.phase = phase
         if self._on_phase:
             try:
@@ -178,7 +185,7 @@ class Workflow:
             plan = Plan(d.scad, d.stl, d.preview)
             self.slice(plan, f"v{version}")
 
-            bed = self.snap("bed-before-print")
+            bed = self.bed_snap("bed-before-print", plan)
             self.set_phase("awaiting_approval")
             question = (
                 (f"<@{self.requester}> " if self.requester else "")
@@ -186,18 +193,22 @@ class Workflow:
                 + ("Assumptions:\n" + "\n".join(f"• {a}" for a in d.assumptions) + "\n" if d.assumptions else "")
                 + f"Slicer estimate: {plan.stats or 'n/a'}\n"
                 + f"Files: `{d.scad}`, `{plan.gcode}`\n"
-                + "The second image is the bed right now: approving confirms it is clear and starts the print."
+                + ("The last image is the bed right now: an approver's `approve` confirms it is clear and starts the print."
+                   if bed else "")
             )
             ans = self.approver.ask(
                 question,
-                {"approve": "print this on the K1C now", "revise": "revise it, e.g. `revise make the base 5mm wider`",
+                {"approve": "print this on the K1C now",
+                 "revise": "revise it, e.g. `revise make the base 5mm wider` (attach photos/sketches if useful)",
                  "abort": "stop the workflow"},
                 images=[p for p in (d.preview, bed) if p],
+                requester_signoff=True,
             )
             if ans.choice == "approve":
                 return plan
             if ans.choice == "abort":
                 raise Abort("rejected at design approval")
+            self.add_reference_images(ans.files)
             previous, feedback, version = d.scad.read_text(), ans.comment or "Please improve it.", version + 1
             previous_preview = d.preview
 
@@ -269,9 +280,10 @@ class Workflow:
             if st.state == "printing":
                 seen_printing = True
             if st.state == "complete":
-                snap = self.snap("complete")
+                snap = self.finish_snap(plan)
                 self.log.log("print_complete", attempt=attempt, status=_fmt_status(st))
                 self.alert(f":white_check_mark: Print finished on attempt {attempt}. {_fmt_status(st)}", snap)
+                self.lower_bed()
                 return "complete", plan
             if st.state in ("cancelled", "standby") and seen_printing:
                 self.log.log("print_cancelled_externally", status=_fmt_status(st))
@@ -398,7 +410,7 @@ class Workflow:
                              overrides=prepared.plan.overrides, model_changed=bool(prepared.fix.scad_diff))
                 text = (f"*Proposed fix for attempt {attempt + 1}*\n\n{fixer.format_for_human(prepared.fix)}\n\n"
                         f"Slicer estimate: {prepared.plan.stats or 'n/a'}\n{prepared.note}")
-            bed = self.snap("bed-before-reprint")
+            bed = self.bed_snap("bed-before-reprint", prepared.plan if prepared else plan)
             options = {}
             if prepared:
                 options["approve"] = "apply this fix and start the reprint (confirms the bed is clear)"
@@ -422,6 +434,68 @@ class Workflow:
             future = self.pool.submit(self.prepare_fix, plan, snap, det_text, status_text, ans.comment or "Try a different approach.")
 
     # ----------------------------------------------------------------- utils
+    def add_reference_images(self, files: list[dict]) -> None:
+        """Download images posted in Slack (with a `revise`) and use them for the next design."""
+        if not files:
+            return
+        if not self.slack.can_download:
+            self.alert("I can't read images with this Slack setup, so I'll go by the text only.")
+            return
+        raw = self.run_dir / "reference-incoming"
+        got = []
+        for i, f in enumerate(files, len(self.reference_images) + 1):
+            try:
+                got.append(self.slack.download(f, raw / slack_mod.local_name(f, i)))
+            except Exception as e:
+                self.log.log("image_download_failed", name=f.get("name"), error=str(e))
+                self.alert(f":warning: Couldn't use image `{f.get('name')}`: {e}")
+        try:
+            new = design.prepare_images(got, self.run_dir / "reference", start=len(self.reference_images) + 1)
+        except (ValueError, FileNotFoundError, OSError) as e:
+            self.alert(f":warning: Couldn't use the new images: {e}")
+            return
+        self.reference_images += new
+        self.log.log("reference_images_added", images=[p.name for p in new])
+
+    def _height(self, plan: Plan) -> float:
+        try:
+            return (gcode_max_z(plan.gcode) or 0.0) if plan.gcode else 0.0
+        except OSError:
+            return 0.0
+
+    def bed_snap(self, label: str, plan: Plan) -> Path | None:
+        """Bed photo for an approval question, with the bed raised toward the camera if that's safe."""
+        if self.cfg.bed_photo_z > 0:
+            try:
+                if why := self.bedview.raise_for_photo(self.cfg.bed_photo_z, self._height(plan)):
+                    self.log.log("bed_not_raised", reason=why)
+            except Exception as e:
+                self.log.log("bed_raise_error", error=repr(e))
+        return self.snap(label)
+
+    def finish_snap(self, plan: Plan) -> Path | None:
+        """The finish photo is taken before the bed goes down (the end G-code leaves it near the camera)."""
+        if self.cfg.finish_photo_lift:
+            try:
+                self.bedview.settle()
+            except Exception as e:
+                self.log.log("settle_error", error=repr(e))
+        snap = self.snap("complete")
+        try:
+            self.bedview.remember_part(self._height(plan))
+        except OSError:
+            pass
+        return snap
+
+    def lower_bed(self) -> None:
+        if not self.cfg.finish_photo_lift:
+            return
+        try:
+            if why := self.bedview.lower():
+                self.log.log("bed_not_lowered", reason=why)
+        except Exception as e:
+            self.log.log("bed_lower_error", error=repr(e))
+
     def snap(self, label: str) -> Path | None:
         try:
             return camera.snapshot(self.snapshot_url, self.run_dir / "snapshots", label)

@@ -106,7 +106,7 @@ def make_wf(tmp_path, monkeypatch):
         w.detectors[0].check = lambda url: DetectorResult("obico", next(det_iter, Signal.OK), 0.0)
         asked = []
 
-        def ask(question, options, images=None, timeout=None):
+        def ask(question, options, images=None, timeout=None, requester_signoff=False):
             choice, comment = answers.pop(0)
             assert choice is None or choice in options, (choice, options)
             asked.append((question.splitlines()[0], choice))
@@ -225,3 +225,20 @@ def test_uploads_get_unique_remote_names(make_wf):
     w = make_wf(printer_script=["complete"], detector_script=[], answers=[("approve", "")])
     w.run()
     assert w.printer.remote_names == [f"printloop_{w.run_dir.name}_v1.gcode"]
+
+
+def test_revise_images_are_added_to_reference_images(make_wf):
+    w = make_wf(printer_script=[], detector_script=[], answers=[])
+    w.slack.can_download = True
+
+    def download(f, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"\xff\xd8\xff")
+        return dest
+
+    w.slack.download = download
+    w.add_reference_images([{"name": "side view.png", "mimetype": "image/png"},
+                            {"name": "IMG_1", "mimetype": "image/jpeg"}])
+    assert [p.name for p in w.reference_images] == ["ref1_01-side_view.png", "ref2_02-IMG_1.jpg"]
+    w.add_reference_images([{"name": "more.png", "mimetype": "image/png"}])
+    assert w.reference_images[-1].name == "ref3_03-more.png" and all(p.exists() for p in w.reference_images)

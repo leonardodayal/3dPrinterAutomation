@@ -64,6 +64,11 @@ class Config:
     approval_backend: str
     approval_poll_seconds: int
 
+    # Photos with the bed near the camera (see printloop/bedview.py)
+    finish_photo_lift: bool  # end printloop prints with the bed just below the part, photo, then lower it
+    bed_photo_z: float  # raise the bed to this Z for approval photos (0 = off); never closer than the part + margin
+    photo_park_xy: tuple[float, float]  # where the toolhead waits during photos (out of the camera's view)
+
     # Monitoring
     check_interval_seconds: int
     pause_timeout_seconds: int  # paused + no human answer -> cancel and cool down
@@ -112,6 +117,9 @@ class Config:
             serve_poll_seconds=_int("SERVE_POLL_SECONDS", 120),
             approval_backend=_env("APPROVAL_BACKEND", "cli"),
             approval_poll_seconds=_int("APPROVAL_POLL_SECONDS", 10),
+            finish_photo_lift=_bool("FINISH_PHOTO_LIFT", True),
+            bed_photo_z=_float("BED_PHOTO_Z", 0),
+            photo_park_xy=tuple(float(v) for v in (_env("PHOTO_PARK_XY", "219,0") or "219,0").split(",")[:2]),
             check_interval_seconds=_int("CHECK_INTERVAL_SECONDS", 120),
             pause_timeout_seconds=_int("PAUSE_TIMEOUT_SECONDS", 900),
             obico_ml_url=(_env("OBICO_ML_URL") or "").rstrip("/") or None,

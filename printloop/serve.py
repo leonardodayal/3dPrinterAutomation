@@ -1,10 +1,15 @@
 """`printloop serve`: take print requests from a shared Slack channel and run them on this printer.
 
 Coworkers post a top-level message in REQUEST_CHANNEL_ID starting with `print` (e.g.
-`print: a cable clip for a 6 mm cable`). Requests are queued (one printer), and each job runs the
-normal workflow with every message kept in the thread under the request. Only APPROVER_USER_IDS can
-give printer-side answers (approve, real/false, removed...); anyone in the thread can revise or abort.
-Replying `status` in a job's thread gets the queue position / phase / time left.
+`print: a cable clip for a 6 mm cable`), optionally with photos/sketches attached (needs the bot's
+files:read scope). Requests are queued (one printer), and each job runs the normal workflow with every
+message kept in the thread under the request. A design prints only after `approve` (or ✅) from both
+the requester and one of APPROVER_USER_IDS; only approvers give the other printer-side answers
+(real/false, removed...). Anyone can `revise` (with more images if useful); the requester or an
+approver can `cancel`.
+
+`status` / `queue` as a new message anywhere in the channel lists the printer and the queue; `status`
+in a job's thread gives that job's position / phase / time left.
 
 The queue and the running job's phase are saved in runs/serve_state.json, so a restart picks up
 waiting jobs again. A job that was already printing is NOT restarted (that would design and print it
@@ -20,17 +25,24 @@ import re
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from . import slack as slack_mod
+from .slack import image_files
 from .config import Config
 from .moonraker import Moonraker
 from .workflow import Workflow
 
 REQUEST_RE = re.compile(r"^\s*(?:<@\w+>\s*)?print\b[\s:,-]*(?P<what>.+)", re.IGNORECASE | re.DOTALL)
 STATUS_RE = re.compile(r"^\s*(status|eta)\b|how long", re.IGNORECASE)
+CHANNEL_STATUS_RE = re.compile(r"^\s*(?:<@\w+>\s*)?(status|queue|eta)\s*[?!.]*\s*$", re.IGNORECASE)
+QUEUE_RE = re.compile(r"^\s*queue\b", re.IGNORECASE)
+CANCEL_RE = re.compile(r"^\s*(cancel|abort)\b", re.IGNORECASE)
+IMAGE_ONLY_REQUEST = "the part shown in the attached image(s)"
 HELP = ("Post a new message here starting with `print`, e.g. `print: a cable clip for a 6 mm cable`. "
-        "I'll design it, ask for approval in the thread, print it and report back.")
+        "Attach photos or sketches if they help (measurements in them are used). "
+        "I'll design it, ask you and an approver to `approve` it in the thread, print it and report back. "
+        "Post `status` any time to see the printer and the queue; reply `cancel` in your request's thread to drop it.")
 PHASE_TEXT = {
     "queued": "waiting in line",
     "waiting_for_printer": "waiting for the printer to be free",
@@ -51,11 +63,15 @@ class Job:
     request: str
     phase: str = "queued"
     seen_ts: str = ""  # newest thread reply already looked at for `status`
+    files: list = field(default_factory=list)  # images attached to the request (Slack file dicts)
+    cancelled: bool = False
 
 
-def parse_request(text: str) -> str | None:
+def parse_request(text: str, has_images: bool = False) -> str | None:
     m = REQUEST_RE.match(text or "")
     if not m:
+        if has_images and re.match(r"^\s*(?:<@\w+>\s*)?print\b[\s:,.!-]*$", text or "", re.IGNORECASE):
+            return IMAGE_ONLY_REQUEST  # `print` + a photo
         return None
     what = m.group("what").strip()
     return what if len(what) >= 3 else None
@@ -91,6 +107,8 @@ class Server:
             self.queue.append(Job(**j))
         if cur := data.get("current"):
             job = Job(**cur)
+            if job.cancelled:
+                job.phase = "done"
             if job.phase in RESUMABLE:
                 job.phase = "queued"
                 self.queue.appendleft(job)
@@ -123,20 +141,27 @@ class Server:
             self.last_ts = max(self.last_ts, msg["ts"], key=float)
             if self.slack.is_own(msg):
                 continue
-            what = parse_request(msg.get("text", ""))
+            text, images = msg.get("text", ""), image_files(msg)
+            if CHANNEL_STATUS_RE.match(text):
+                self._post_safe(msg["ts"], self._overview_text())
+                continue
+            what = parse_request(text, bool(images))
             if what is None:
-                if re.match(r"^\s*print\b", msg.get("text", ""), re.I):
+                if re.match(r"^\s*print\b", text, re.I):
                     self.slack.post(HELP, thread_ts=msg["ts"])
                 continue
-            job = Job(msg["ts"], msg.get("user", ""), what, seen_ts=msg["ts"])
+            job = Job(msg["ts"], msg.get("user", ""), what, seen_ts=msg["ts"], files=images)
             with self.lock:
                 self.queue.append(job)
                 ahead = len(self.queue) - 1 + (1 if self.current else 0)
+            pics = f" (+{len(images)} image{'s' if len(images) != 1 else ''})" if images else ""
+            if images and not self.slack.can_download:
+                pics += ". I can't read images with this Slack setup, so I'll go by the text"
             self.slack.post(
-                f"<@{job.user}> got it: _{what}_. "
+                f"<@{job.user}> got it: _{what}_{pics}. "
                 + ("Starting now: I'll design it and ask for approval in this thread."
                    if not ahead else f"You're #{ahead + 1} in line; I'll start here when the printer is free.")
-                + " Reply `status` here any time.",
+                + " Reply `status` or `cancel` here any time.",
                 thread_ts=job.ts)
         self._save_state()
         if self.answer_status:
@@ -160,13 +185,28 @@ class Server:
         job.phase = phase
         self._save_state()
 
+    def _download_images(self, job: Job, thread: slack_mod.Slack) -> list:
+        if not job.files or not self.slack.can_download:
+            return []
+        dest, paths = self.cfg.runs_dir / "incoming" / job.ts, []
+        for i, f in enumerate(job.files, 1):
+            try:
+                paths.append(self.slack.download(f, dest / slack_mod.local_name(f, i)))
+            except Exception as e:
+                thread.post(f":warning: Couldn't read image `{f.get('name')}` ({e}); going on without it.")
+        return paths
+
     def _run_job(self, job: Job) -> None:
         thread = slack_mod.ThreadSlack(self.slack, job.ts)
         try:
             self._set_phase(job, "waiting_for_printer")
-            self._wait_for_printer(thread)
+            self._wait_for_printer(thread, job)
+            if job.cancelled:
+                return
+            kw = {"images": images} if (images := self._download_images(job, thread)) else {}
             wf = self.workflow_factory(self.cfg, job.request, slack=thread, requester=job.user,
-                                       on_phase=lambda p: self._set_phase(job, p))
+                                       on_phase=lambda p: self._set_phase(job, p),
+                                       should_stop=lambda: job.cancelled, **kw)
             wf.run()
         except SystemExit as e:  # preflight problems
             thread.post(f":warning: Couldn't start this job:\n{e}")
@@ -187,9 +227,9 @@ class Server:
         except Exception:
             return None
 
-    def _wait_for_printer(self, thread: slack_mod.Slack) -> None:
+    def _wait_for_printer(self, thread: slack_mod.Slack, job: Job | None = None) -> None:
         told = False
-        while busy := self._busy_or_unreachable():
+        while not (job and job.cancelled) and (busy := self._busy_or_unreachable()):
             if not told:
                 left = self._time_left()
                 thread.post(f"The printer is busy ({left or busy}). I'll start as soon as it's free.")
@@ -216,6 +256,39 @@ class Server:
                 text += " The printer is free."
         return text
 
+    def _overview_text(self) -> str:
+        """Printer + queue, for `status` / `queue` posted anywhere in the channel."""
+        busy, left = self._busy_or_unreachable(), self._time_left()
+        lines = [f"*Printer:* {left or busy or 'free'}"]
+        with self.lock:
+            cur, queued = self.current, list(self.queue)
+        if cur and cur.phase != "done":
+            lines.append(f"*Now:* _{cur.request}_ for <@{cur.user}>: {PHASE_TEXT.get(cur.phase, cur.phase)}")
+        lines += [f"{i}. _{j.request}_ for <@{j.user}>" for i, j in enumerate(queued, 1)]
+        if not queued:
+            lines.append("Nobody is waiting." if cur else "Nothing queued. Post `print: …` to request a part.")
+        return "\n".join(lines)
+
+    def _cancel(self, job: Job, user: str) -> str | None:
+        """Handle `cancel` in a job thread; returns the reply (None: the job's open question handles it)."""
+        approvers = self.cfg.approver_user_ids
+        if user != job.user and approvers and user not in approvers:
+            return f"<@{user}> only <@{job.user}> or an approver can cancel this request."
+        with self.lock:
+            if job in self.queue:
+                self.queue.remove(job)
+                job.phase, job.cancelled = "done", True
+                return "Cancelled: removed from the queue."
+        if job.phase in ("awaiting_approval", "recovering"):
+            return None  # the open question in this thread treats `cancel` as `abort`
+        if job.phase == "printing":
+            return ("It's already printing, so I won't stop it from here. An approver can cancel it "
+                    "at the printer (or with `printloop cancel` on the host).")
+        if job.phase == "done":
+            return None
+        job.cancelled = True
+        return "Cancelling: I'll stop before the next step."
+
     def _answer_status_requests(self) -> None:
         with self.lock:
             jobs = ([self.current] if self.current else []) + list(self.queue)
@@ -229,8 +302,13 @@ class Server:
                 if float(m["ts"]) <= float(job.seen_ts or job.ts) or self.slack.is_own(m):
                     continue
                 job.seen_ts = m["ts"]
-                if STATUS_RE.search(m.get("text", "")):
-                    self._post_safe(job.ts, f"<@{m.get('user', '')}> {self._status_text(job)}")
+                text, user = m.get("text", ""), m.get("user", "")
+                if QUEUE_RE.match(text):
+                    self._post_safe(job.ts, self._overview_text())
+                elif STATUS_RE.search(text):
+                    self._post_safe(job.ts, f"<@{user}> {self._status_text(job)}")
+                elif CANCEL_RE.match(text) and (reply := self._cancel(job, user)):
+                    self._post_safe(job.ts, reply)
         self._save_state()
 
     # --- main loop ---------------------------------------------------------

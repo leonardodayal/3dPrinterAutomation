@@ -1,4 +1,5 @@
 import threading
+import time
 from dataclasses import replace
 
 import pytest
@@ -18,6 +19,7 @@ class FakeSlack(slack_mod.Slack):
         self.channel = []   # top-level messages
         self.threads = {}   # root ts -> replies
         self.posts = []     # (thread_ts, text)
+        self.reacted = {}   # ts -> [{name, users}]
         self._n = 1000
 
     def _ts(self):
@@ -43,8 +45,21 @@ class FakeSlack(slack_mod.Slack):
     def channel_messages(self, oldest):
         return [m for m in self.channel if float(m["ts"]) > float(oldest or 0)]
 
-    def say(self, user, text, thread_ts=None):
-        msg = {"ts": self._ts(), "user": user, "text": text}
+    can_download = True
+
+    def reactions(self, ts):
+        return self.reacted.get(ts, [])
+
+    def react(self, ts, name):
+        return False  # ack in text so tests can see it
+
+    def download(self, file, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"\xff\xd8\xff")
+        return dest
+
+    def say(self, user, text, thread_ts=None, files=None):
+        msg = {"ts": self._ts(), "user": user, "text": text, "files": files or []}
         (self.threads.setdefault(thread_ts, []) if thread_ts else self.channel).append(msg)
         return msg["ts"]
 
@@ -84,7 +99,7 @@ def test_poll_queues_acks_and_runs_jobs_in_threads(cfg):
     s, ran, gate = FakeSlack(), [], threading.Event()
 
     class FakeWorkflow:
-        def __init__(self, cfg, request, slack, requester, on_phase=None):
+        def __init__(self, cfg, request, slack, requester, on_phase=None, **k):
             self.request, self.slack, self.requester, self.on_phase = request, slack, requester, on_phase
 
         def run(self):
@@ -258,3 +273,159 @@ def test_state_survives_round_trip(cfg):
     assert state["current"]["request"] == "one" and state["current"]["phase"] == "designing"
     assert [j["request"] for j in state["queue"]] == ["two"]
     gate.set(); srv.worker.join(2)
+
+
+PHOTO = {"id": "F1", "name": "knob.jpg", "mimetype": "image/jpeg", "url": "https://files.slack.com/x"}
+
+
+def test_request_images_are_downloaded_and_passed_on(cfg):
+    s, got = FakeSlack(), {}
+
+    class W:
+        def __init__(self, cfg, request, images=None, **k):
+            got.update(request=request, images=images)
+
+        def run(self):
+            pass
+
+    srv = Server(cfg, slack=s, printer=FakePrinter(), workflow_factory=W)
+    srv.last_ts = "0"
+    s.say(COWORKER, "print", files=[PHOTO, {"id": "F2", "name": "notes.pdf", "mimetype": "application/pdf"}])
+    srv.poll_once(); srv.worker.join(2)
+    assert got["request"] == "the part shown in the attached image(s)"
+    assert [p.name for p in got["images"]] == ["01-knob.jpg"] and got["images"][0].exists()
+    assert "(+1 image)" in s.posts[0][1]
+
+
+def test_channel_status_and_queue_without_a_thread(cfg):
+    s, gate = FakeSlack(), threading.Event()
+
+    class W:
+        def __init__(self, *a, on_phase=None, **k):
+            self.on_phase = on_phase
+
+        def run(self):
+            self.on_phase("designing")
+            gate.wait(5)
+
+    srv = Server(cfg, slack=s, printer=StatusPrinter(), workflow_factory=W)
+    srv.last_ts = "0"
+    s.say(COWORKER, "print: first"); s.say(OWNER, "print: second")
+    srv.poll_once(); srv.worker.join(0.2)
+    q = s.say(COWORKER, "status?")
+    s.say(COWORKER, "what's the status of lunch")   # chatter, not a command
+    srv.poll_once()
+    replies = [t for ts, t in s.posts if ts == q]
+    assert len(replies) == 1 and "~47-71 min left" in replies[0]
+    assert "_first_" in replies[0] and "Claude is designing it" in replies[0] and "1. _second_" in replies[0]
+    assert len([p for p in s.posts if p[0] not in (q,)]) == 2     # only the two request acks otherwise
+    gate.set(); srv.worker.join(2)
+
+
+def test_cancel_queued_job_only_by_requester_or_approver(cfg):
+    s, gate = FakeSlack(), threading.Event()
+
+    class W:
+        def __init__(self, *a, **k):
+            pass
+
+        def run(self):
+            gate.wait(5)
+
+    srv = Server(cfg, slack=s, printer=FakePrinter(), workflow_factory=W)
+    srv.answer_status = True
+    srv.last_ts = "0"
+    s.say(OWNER, "print: first")
+    b = s.say(COWORKER, "print: second")
+    srv.poll_once(); srv.worker.join(0.2)
+    s.say("U0STRANGER", "cancel", thread_ts=b)
+    srv.poll_once()
+    assert [j.request for j in srv.queue] == ["second"]
+    s.say(COWORKER, "cancel please", thread_ts=b)
+    srv.poll_once()
+    assert not srv.queue
+    assert any(ts == b and "removed from the queue" in t for ts, t in s.posts)
+    gate.set(); srv.worker.join(2)
+
+
+def test_cancel_while_waiting_for_printer_stops_before_designing(cfg):
+    s, started = FakeSlack(), []
+    class Busy(StatusPrinter):
+        def busy_reason(self):
+            time.sleep(0.01)
+            return "printing x"
+
+    srv = Server(cfg, slack=s, printer=Busy(), workflow_factory=lambda *a, **k: started.append(1))
+    srv.answer_status = True
+    srv.last_ts = "0"
+    a = s.say(COWORKER, "print: thing")
+    srv.poll_once(); srv.worker.join(0.1)
+    s.say(COWORKER, "cancel", thread_ts=a)
+    srv.poll_once(); srv.worker.join(2)
+    assert not srv.worker.is_alive() and not started
+
+
+def _ask_in_thread(cfg, script, requester=COWORKER, approvers=(OWNER,)):
+    import printloop.approval as ap_mod
+    s = FakeSlack()
+    root = s.say(requester, "print: x")
+    t = slack_mod.ThreadSlack(s, root)
+    ap = Approver("slack", t, Log(), 0, approvers=set(approvers), requester=requester)
+    orig, steps = t.thread_replies, iter(script)
+
+    def replies(ts):
+        f = next(steps, None)
+        if f:
+            f(s, root, ts)
+        return orig(ts)
+
+    t.thread_replies = replies
+    ans = ap.ask("Print?", {"approve": "go", "revise": "change", "abort": "stop"}, requester_signoff=True)
+    return ans, s
+
+
+def test_design_needs_requester_and_approver(cfg, monkeypatch):
+    monkeypatch.setattr("printloop.approval.time.sleep", lambda s: None)
+    ans, s = _ask_in_thread(cfg, [
+        lambda s, root, q: s.say(OWNER, "approve bed clear", thread_ts=root),
+        lambda s, root, q: s.say(COWORKER, "approve", thread_ts=root),
+    ])
+    assert ans.choice == "approve" and set(ans.who.split(",")) == {OWNER, COWORKER} and ans.comment == "bed clear"
+    assert any(f"Still waiting for <@{COWORKER}>" in t for _, t in s.posts)
+    assert any("*and* from" in t for _, t in s.posts)
+
+
+def test_reaction_counts_as_approve_and_requester_alone_is_not_enough(cfg, monkeypatch):
+    monkeypatch.setattr("printloop.approval.time.sleep", lambda s: None)
+
+    def react(users):
+        def f(s, root, q):
+            s.reacted[q] = [{"name": "white_check_mark", "users": users}]
+        return f
+
+    ans, s = _ask_in_thread(cfg, [react([COWORKER]), lambda *a: None, react([COWORKER, OWNER])])
+    assert ans.choice == "approve" and set(ans.who.split(",")) == {COWORKER, OWNER}
+    assert sum("Still waiting" in t for _, t in s.posts) == 1
+
+
+def test_requester_who_is_approver_signs_off_alone(cfg, monkeypatch):
+    monkeypatch.setattr("printloop.approval.time.sleep", lambda s: None)
+    ans, _ = _ask_in_thread(cfg, [lambda s, root, q: s.say(OWNER, "approve", thread_ts=root)], requester=OWNER)
+    assert (ans.choice, ans.who) == ("approve", OWNER)
+
+
+def test_revise_brings_thread_images_and_cancel_means_abort(cfg, monkeypatch):
+    monkeypatch.setattr("printloop.approval.time.sleep", lambda s: None)
+    ans, s = _ask_in_thread(cfg, [
+        lambda s, root, q: s.say(COWORKER, "", thread_ts=root, files=[PHOTO]),
+        lambda s, root, q: s.say("U0OTHER", "revise like this photo", thread_ts=root),
+    ])
+    assert (ans.choice, ans.comment, ans.files) == ("revise", "like this photo", [PHOTO])
+    assert not any("To answer, start" in t for _, t in s.posts)   # image-only message isn't nagged
+
+    ans, s = _ask_in_thread(cfg, [
+        lambda s, root, q: s.say("U0OTHER", "cancel", thread_ts=root),
+        lambda s, root, q: s.say(COWORKER, "cancel", thread_ts=root),
+    ])
+    assert (ans.choice, ans.who) == ("abort", COWORKER)
+    assert any("can stop this job" in t for _, t in s.posts)

@@ -4,7 +4,9 @@ Backends (SLACK_BACKEND):
 - mcp:     your claude.ai Slack connector, driven through headless Claude Code (`claude -p`).
            Messages are sent AS YOU to SLACK_MCP_CHANNEL_ID (a channel or DM id). No Slack app needed.
 - bot:     a Slack app bot token (SLACK_BOT_TOKEN + SLACK_CHANNEL_ID).
-           Scopes: chat:write, files:write, channels:history (groups:history for private channels).
+           Scopes: chat:write, files:write, channels:history (groups:history for private channels);
+           optional: files:read (images attached to requests), reactions:read (✅ on an approval post
+           counts as `approve`), reactions:write (acknowledge answers with a reaction instead of a reply).
 - webhook: incoming webhook (SLACK_WEBHOOK_URL): text only, no images, no replies.
 
 Every message the workflow posts starts with MARKER so replies can be told apart from our own
@@ -30,17 +32,57 @@ def _mark(text: str) -> str:
     return text if text.startswith(MARKER) else f"{MARKER} · {text}"
 
 
+IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
+
+
+def image_files(msg: dict) -> list[dict]:
+    """The image attachments of a message ({id, name, url, mimetype}); other file types are ignored."""
+    return [f for f in msg.get("files") or []
+            if (f.get("mimetype") or "").startswith("image/") or Path(f.get("name", "")).suffix.lower() in IMAGE_TYPES]
+
+
+def local_name(file: dict, n: int) -> str:
+    """A safe local file name for a Slack attachment, with an image suffix even if Slack's name lacks one."""
+    name = re.sub(r"[^\w.-]", "_", Path(file.get("name") or "image").name)[:60] or "image"
+    if Path(name).suffix.lower() not in IMAGE_TYPES:
+        sub = (file.get("mimetype") or "image/jpeg").split("/")[-1].lower()
+        name += "." + ("jpg" if sub == "jpeg" else sub)
+    return f"{n:02d}-{name}"
+
+
 class Slack:
-    """Common interface. `has_bot` means: can attach images and read thread replies."""
+    """Common interface. `has_bot` means: can attach images and read thread replies.
+    `can_download`: can fetch files people attached. Reactions are best effort (missing scopes -> no-ops)."""
 
     has_bot = False
     enabled = False
+    can_download = False
 
     def post(self, text: str, thread_ts: str | None = None) -> str | None:
         raise NotImplementedError
 
     def post_image(self, image: Path, comment: str, thread_ts: str | None = None) -> None:
         raise NotImplementedError
+
+    def post_images(self, images: list[Path], comment: str, thread_ts: str | None = None) -> None:
+        """Several images in one message where the backend supports it."""
+        if not images:
+            self.post(comment, thread_ts=thread_ts)
+            return
+        self.post_image(images[0], comment, thread_ts=thread_ts)
+        for img in images[1:]:
+            self.post_image(img, img.name, thread_ts=thread_ts)
+
+    def download(self, file: dict, dest: Path) -> Path:
+        raise NotImplementedError
+
+    def reactions(self, ts: str) -> list[dict]:
+        """[{name, users}] on a message; [] when unsupported."""
+        return []
+
+    def react(self, ts: str, name: str) -> bool:
+        """Add a reaction; False when unsupported (the caller then replies in text)."""
+        return False
 
     def thread_replies(self, ts: str) -> list[dict]:
         raise NotImplementedError
@@ -75,11 +117,33 @@ class WebhookSlack(Slack):
         self.post(f"{comment}\n_(snapshot saved on host: `{image}`; webhooks can't attach images)_")
 
 
+def _msg(m: dict) -> dict:
+    files = [{"id": f.get("id"), "name": f.get("name") or f.get("title") or "image",
+              "mimetype": f.get("mimetype", ""), "url": f.get("url_private_download") or f.get("url_private")}
+             for f in m.get("files") or []]
+    return {"ts": m["ts"], "user": m.get("user", ""), "text": m.get("text", ""), "bot_id": m.get("bot_id"),
+            "files": files}
+
+
 class BotSlack(Slack):
-    has_bot = enabled = True
+    has_bot = enabled = can_download = True
 
     def __init__(self, bot_token: str, channel_id: str):
         self.bot_token, self.channel_id = bot_token, channel_id
+        self.missing_scopes: set[str] = set()  # warned about once, then skipped
+
+    def _optional(self, method: str, scope: str, **kw) -> dict | None:
+        """Call a method whose scope may not be granted yet: degrade instead of failing the job."""
+        if scope in self.missing_scopes:
+            return None
+        try:
+            return self._api(method, **kw)
+        except RuntimeError as e:
+            if "missing_scope" in str(e):
+                self.missing_scopes.add(scope)
+                print(f"Slack app lacks the {scope} scope: {method} disabled until it's added")
+                return None
+            raise
 
     def _api(self, method: str, **kw) -> dict:
         r = requests.post(API + method, headers={"Authorization": f"Bearer {self.bot_token}"}, timeout=30, **kw)
@@ -95,21 +159,53 @@ class BotSlack(Slack):
         return self._api("chat.postMessage", json=payload)["ts"]
 
     def post_image(self, image, comment, thread_ts=None):
-        data = image.read_bytes()
-        up = self._api("files.getUploadURLExternal", data={"filename": image.name, "length": len(data)})
-        requests.post(up["upload_url"], files={"file": (image.name, data)}, timeout=60).raise_for_status()
-        payload = {"files": [{"id": up["file_id"], "title": image.name}], "channel_id": self.channel_id,
-                   "initial_comment": _mark(comment)}
+        self.post_images([image], comment, thread_ts)
+
+    def post_images(self, images, comment, thread_ts=None):
+        if not images:
+            self.post(comment, thread_ts=thread_ts)
+            return
+        files = []
+        for image in images:
+            data = image.read_bytes()
+            up = self._api("files.getUploadURLExternal", data={"filename": image.name, "length": len(data)})
+            requests.post(up["upload_url"], files={"file": (image.name, data)}, timeout=60).raise_for_status()
+            files.append({"id": up["file_id"], "title": image.name})
+        payload = {"files": files, "channel_id": self.channel_id, "initial_comment": _mark(comment)}
         if thread_ts:
             payload["thread_ts"] = thread_ts
         self._api("files.completeUploadExternal", json=payload)
+
+    def download(self, file, dest):
+        if "files:read" in self.missing_scopes or not file.get("url"):
+            raise RuntimeError("can't download Slack files (the app needs the files:read scope)")
+        r = requests.get(file["url"], headers={"Authorization": f"Bearer {self.bot_token}"}, timeout=60)
+        r.raise_for_status()
+        if r.headers.get("Content-Type", "").startswith("text/html"):  # Slack's login page = no files:read
+            self.missing_scopes.add("files:read")
+            raise RuntimeError("can't download Slack files (the app needs the files:read scope)")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(r.content)
+        return dest
+
+    def reactions(self, ts):
+        out = self._optional("reactions.get", "reactions:read",
+                             data={"channel": self.channel_id, "timestamp": ts, "full": "true"})
+        return out.get("message", {}).get("reactions", []) if out else []
+
+    def react(self, ts, name):
+        try:
+            return self._optional("reactions.add", "reactions:write",
+                                  data={"channel": self.channel_id, "timestamp": ts, "name": name}) is not None
+        except RuntimeError as e:
+            return "already_reacted" in str(e)
 
     def thread_replies(self, ts):
         r = requests.get(API + "conversations.replies", headers={"Authorization": f"Bearer {self.bot_token}"},
                          params={"channel": self.channel_id, "ts": ts, "limit": 200}, timeout=30).json()
         if not r.get("ok"):
             raise RuntimeError(f"Slack conversations.replies failed: {r.get('error')}")
-        return r["messages"][1:]
+        return [_msg(m) for m in r["messages"][1:]]
 
     def channel_messages(self, oldest):
         params = {"channel": self.channel_id, "limit": 100}
@@ -120,8 +216,7 @@ class BotSlack(Slack):
         if not r.get("ok"):
             raise RuntimeError(f"Slack conversations.history failed: {r.get('error')}")
         msgs = [m for m in r["messages"] if not oldest or float(m["ts"]) > float(oldest)]
-        return sorted(({"ts": m["ts"], "user": m.get("user", ""), "text": m.get("text", ""),
-                        "bot_id": m.get("bot_id")} for m in msgs), key=lambda m: float(m["ts"]))
+        return sorted((_msg(m) for m in msgs), key=lambda m: float(m["ts"]))
 
 
 # ---------------------------------------------------------------- claude.ai connector (MCP)
@@ -230,13 +325,25 @@ class ThreadSlack(Slack):
 
     def __init__(self, inner: Slack, root_ts: str):
         self.inner, self.root_ts = inner, root_ts
-        self.has_bot, self.enabled = inner.has_bot, inner.enabled
+        self.has_bot, self.enabled, self.can_download = inner.has_bot, inner.enabled, inner.can_download
 
     def post(self, text, thread_ts=None):
         return self.inner.post(text, thread_ts=self.root_ts)
 
     def post_image(self, image, comment, thread_ts=None):
         return self.inner.post_image(image, comment, thread_ts=self.root_ts)
+
+    def post_images(self, images, comment, thread_ts=None):
+        return self.inner.post_images(images, comment, thread_ts=self.root_ts)
+
+    def download(self, file, dest):
+        return self.inner.download(file, dest)
+
+    def reactions(self, ts):
+        return self.inner.reactions(ts)
+
+    def react(self, ts, name):
+        return self.inner.react(ts, name)
 
     def thread_replies(self, ts):
         # Questions are themselves replies in the job thread: answers are the replies after them.

@@ -15,6 +15,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from .bedview import finish_end_gcode
 from .config import Config
 
 
@@ -80,6 +81,8 @@ def slice_model(cfg: Config, stl: Path, overrides: dict[str, str], out_dir: Path
             if not p:
                 raise SliceError(f"Set ORCA_{name.upper()}_JSON")
             files[name] = json.loads(p.read_text())
+        if cfg.finish_photo_lift:  # keep the bed near the camera for the finish photo (see bedview.py)
+            files["machine"]["machine_end_gcode"] = finish_end_gcode(cfg.photo_park_xy)
         for k, v in overrides.items():
             # Put each override where the key already lives; default to the process profile.
             target = next((f for f in ("filament", "process", "machine") if k in files[f]), "process")

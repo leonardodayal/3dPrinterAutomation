@@ -29,6 +29,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--scad", type=Path, help="start from an existing OpenSCAD file instead of generating one")
     run.add_argument("--image", type=Path, action="append", default=[], metavar="PATH",
                      help="reference photo/sketch for the design (repeatable; jpg, png, gif, webp, heic)")
+    bv = sub.add_parser("bed-view", help="(watch the printer!) raise the bed for a photo, to tune BED_PHOTO_Z / "
+                        "PHOTO_PARK_XY; Z must already be homed")
+    bv.add_argument("--z", type=float, help="bed Z to try (default BED_PHOTO_Z, else 60)")
+    bv.add_argument("--park", help="toolhead X,Y to try (default PHOTO_PARK_XY)")
+    bv.add_argument("--lower", action="store_true", help="just lower the bed to the bottom")
     for name in ("serve", "preflight", "status", "test-alert", "cancel", "estop"):
         sub.add_parser(name)
     args = ap.parse_args(argv)
@@ -52,6 +57,18 @@ def main(argv: list[str] | None = None) -> int:
         wf.snapshot_url = wf.snapshot_url or printer.webcam_snapshot_url()
         snap = wf.snap("test") if wf.snapshot_url else None
         wf.alert(":test_tube: printloop test alert: Slack is wired up.", snap)
+    elif args.cmd == "bed-view":
+        from . import camera
+        from .bedview import BedView
+        park = tuple(float(v) for v in args.park.split(",")) if args.park else cfg.photo_park_xy
+        view = BedView(printer, cfg.runs_dir / "bed_state.json", park)
+        why = view.lower() if args.lower else view.raise_for_photo(args.z or cfg.bed_photo_z or 60)
+        if why:
+            print(f"Didn't move: {why}")
+            return 1
+        url = cfg.camera_snapshot_url or printer.webcam_snapshot_url()
+        if url and not args.lower:
+            print("Snapshot:", camera.snapshot(url, cfg.runs_dir / "bed-view", "bed-view").resolve())
     elif args.cmd == "cancel":
         printer.cancel_and_cool()
         print("Cancelled; heaters off.")

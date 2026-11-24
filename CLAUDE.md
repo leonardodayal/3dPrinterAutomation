@@ -19,6 +19,7 @@ README.md has the full design; this file is the short version for Claude session
 ```bash
 .venv/bin/python -m pytest -q                       # all tests must pass before restarting the service
 .venv/bin/python -m printloop status | preflight | test-alert | cancel | estop
+.venv/bin/python -m printloop bed-view [--z 60] [--park 219,0] [--lower]   # moves the bed: only with someone watching
 .venv/bin/python -m printloop run "description" [--image photo.jpg] [--scad file.scad]
 launchctl kickstart -k gui/$(id -u)/com.printloop.serve   # restart the background service after code changes
 ```

@@ -87,6 +87,11 @@ class Moonraker:
             bed_temp=(res.get("heater_bed") or {}).get("temperature"),
         )
 
+    def toolhead(self) -> dict:
+        """{homed_axes: 'xyz', position: [x, y, z, e], axis_maximum: [...]}"""
+        return (self._req("GET", "/printer/objects/query",
+                          params={"toolhead": "homed_axes,position,axis_maximum"}).get("status") or {}).get("toolhead") or {}
+
     def busy_reason(self) -> str | None:
         """Why the printer can't take a new job right now, or None if it's free.
 
